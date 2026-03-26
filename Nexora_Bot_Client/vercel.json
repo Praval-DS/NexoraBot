@@ -1,8 +1,12 @@
 {
   "rewrites": [
     {
-      "source": "/api/:path*",
-      "destination": "https://chartographically-postlabial-cris.ngrok-free.dev/api/:path*"
+      "source": "/api/projects",
+      "destination": "https://chartographically-postlabial-cris.ngrok-free.dev/api/projects/"
+    },
+    {
+      "source": "/api/projects/:path*",
+      "destination": "https://chartographically-postlabial-cris.ngrok-free.dev/api/projects/:path*/"
     }
   ]
 }
