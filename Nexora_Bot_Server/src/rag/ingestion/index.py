@@ -16,7 +16,77 @@ from src.rag.ingestion.utils import (
 from src.models.index import ProcessingStatus
 from unstructured.chunking.title import chunk_by_title
 from src.services.webScrapper import scrapingbee_client
+import hashlib
 
+def _process_structured_file(document_id: str, document: dict):
+    """
+    For CSV/Excel files: compute a data profile and generate column embeddings.
+    Stores both in processing_details so SmartDataAgent can use them at query time.
+    """
+    import tempfile, pandas as pd
+    from pathlib import Path
+
+    update_status_in_database(document_id, ProcessingStatus.PROCESSING)
+
+    try:
+        # Download file from S3
+        s3_key = document["s3_key"]
+        filename = document["filename"]
+        file_ext = filename.split(".")[-1].lower()
+
+        with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_ext}") as tmp:
+            temp_path = Path(tmp.name)
+        s3_client.download_file(appConfig["s3_bucket_name"], s3_key, str(temp_path))
+
+        df = pd.read_csv(temp_path) if file_ext == "csv" else pd.read_excel(temp_path)
+        temp_path.unlink(missing_ok=True)
+
+        # --- Compute data profile ---
+        profile = {}
+        for col in df.columns:
+            col_data = df[col].dropna()
+            entry = {
+                "dtype": str(df[col].dtype),
+                "null_pct": round(df[col].isna().mean() * 100, 1),
+                "unique_count": int(df[col].nunique()),
+                "row_count": len(df),
+                "sample_vals": col_data.head(5).tolist(),
+            }
+            if pd.api.types.is_numeric_dtype(df[col]) and len(col_data) > 0:
+                entry.update({
+                    "min": round(float(col_data.min()), 4),
+                    "max": round(float(col_data.max()), 4),
+                    "mean": round(float(col_data.mean()), 4),
+                    "std": round(float(col_data.std()), 4),
+                    "median": round(float(col_data.median()), 4),
+                })
+            profile[col] = entry
+
+        # --- Generate column embeddings for semantic mapping ---
+        # Embed "column_name: sample_val1, sample_val2, ..." for richer signal
+        col_texts = [
+            f"{col}: {', '.join(str(v) for v in profile[col]['sample_vals'][:3])}"
+            for col in df.columns
+        ]
+        col_embeddings_raw = openAI["embeddings"].embed_documents(col_texts)
+        col_embeddings = {
+            col: col_embeddings_raw[i]
+            for i, col in enumerate(df.columns)
+        }
+
+        # Store everything in processing_details
+        update_status_in_database(
+            document_id,
+            ProcessingStatus.COMPLETED,
+            {
+                "data_profile": profile,
+                "column_embeddings": col_embeddings,  # used by SmartDataAgent for semantic mapping
+                "table_shape": {"rows": len(df), "cols": len(df.columns)},
+            }
+        )
+
+    except Exception as e:
+        raise Exception(f"Failed to profile structured file {document_id}: {str(e)}")
 
 def process_document(document_id: str):
     """
@@ -47,12 +117,15 @@ def process_document(document_id: str):
 
         # [NEW] Check for structured data files and skip RAG processing
         filename = document.get("filename", "").lower()
-        if filename.endswith(('.csv', '.xlsx', '.xls', '.json')):
-            update_status_in_database(document_id, ProcessingStatus.COMPLETED)
-            return {
-                "success": True,
-                "document_id": document_id,
-           }
+        # if filename.endswith(('.csv', '.xlsx', '.xls', '.json')):
+        #     update_status_in_database(document_id, ProcessingStatus.COMPLETED)
+        #     return {
+        #         "success": True,
+        #         "document_id": document_id,
+        #    }
+        if filename.endswith(('.csv', '.xlsx', '.xls')):
+            _process_structured_file(document_id, document)
+            return {"success": True, "document_id": document_id}
 
 
 
@@ -163,69 +236,69 @@ def download_content_and_partition(document_id: str, document: dict):
         document_source_type = document["source_type"]
         elements = None
         temp_path: Path | None = None
-
+ 
         if document_source_type == "file":
             s3_key = document["s3_key"]
             filename = document["filename"]
             file_type = filename.split(".")[-1].lower()
-
+ 
             # ===================== ORIGINAL BLOCK (REPLACED) =====================
             # temp_file_path = f"/tmp/{document_id}.{file_type}"
             # s3_client.download_file(appConfig["s3_bucket_name"], s3_key, temp_file_path)
             # elements = partition_document(temp_file_path, file_type)
             # ================================================================
-
+ 
             # TEMP FILE VERSION
             with tempfile.NamedTemporaryFile(delete=False, suffix=f".{file_type}") as tmp:
                 temp_path = Path(tmp.name)
-
+ 
             s3_client.download_file(
                 appConfig["s3_bucket_name"],
                 s3_key,
                 str(temp_path),
             )
-
+ 
             if not temp_path.exists() or temp_path.stat().st_size == 0:
                 raise Exception(f"File download failed or empty: {temp_path}")
-
+ 
             elements = partition_document(str(temp_path), file_type)
-
+ 
         elif document_source_type == "url":
             url = document["source_url"]
-
+ 
             # ===================== ORIGINAL BLOCK (REPLACED) =====================
             # temp_file_path = f"/tmp/{document_id}.html"
             # with open(temp_file_path, "wb") as f:
             #     f.write(response.content)
             # elements = partition_document(temp_file_path, "html", source_type="url")
             # ================================================================
-
+ 
             response = scrapingbee_client.get(url)
-
+ 
             with tempfile.NamedTemporaryFile(delete=False, suffix=".html") as tmp:
                 temp_path = Path(tmp.name)
                 tmp.write(response.content)
-
+ 
             if not temp_path.exists():
                 raise Exception(f"Failed to write crawled HTML to temp file: {temp_path}")
-
+ 
             elements = partition_document(
                 str(temp_path),
                 "html",
                 source_type="url",
             )
-
+ 
         else:
             raise Exception(f"Unsupported source_type: {document_source_type}")
-
+ 
         elements_summary = analyze_elements(elements)
-
+ 
         # Safe cleanup
         if temp_path and temp_path.exists():
             temp_path.unlink(missing_ok=True)
-
+ 
         return elements_summary, elements
-
+ 
     except Exception as e:
         raise Exception(
             f"Failed in Step 1 to download content and partition elements: {str(e)}"
@@ -262,6 +335,7 @@ def summarise_chunks(chunks, document_id, source_type="file"):
     try:
         processed_chunks = []
         total_chunks = len(chunks)
+        seen_image_hashes = set()
 
         for i, chunk in enumerate(chunks):
             current_chunk = i + 1
@@ -287,7 +361,15 @@ def summarise_chunks(chunks, document_id, source_type="file"):
             # }
             content_data = separate_content_types(chunk, source_type)
 
-            # * Use AI summarization only when the chunk contains at least one table or image.
+            # Deduplicate images using MD5 hash
+            unique_images = []
+            for img_b64 in content_data["images"]:
+                img_hash = hashlib.md5(img_b64.encode()).hexdigest()
+                if img_hash not in seen_image_hashes:
+                    seen_image_hashes.add(img_hash)
+                    unique_images.append(img_b64)
+            content_data["images"] = unique_images
+
             if content_data["tables"] or content_data["images"]:
                 enhanced_content = create_ai_summary(
                     content_data["text"], content_data["tables"], content_data["images"]

@@ -4,6 +4,8 @@ from fastapi import APIRouter, HTTPException, Depends
 from src.agents.simple_agent.agent import create_simple_rag_agent
 from src.agents.supervisor_agent.agent import create_supervisor_agent
 import httpx
+from src.services.llm import openAI
+import json
 
 from src.services.supabase import supabase
 from src.services.clerkAuth import get_current_user_clerk_id
@@ -14,6 +16,7 @@ import shutil
 from src.services.awsS3 import s3_client
 from src.config.index import appConfig
 from src.agents.csv_agent import create_project_csv_agent
+
 
 router = APIRouter(tags=["projectRoutes"])
 """
@@ -147,6 +150,7 @@ async def create_project(
 
     except HTTPException as e:
         raise e
+
     except Exception as e:
         raise HTTPException(
             status_code=500,
@@ -453,6 +457,247 @@ def get_chat_history(chat_id: str, exclude_message_id: str = None) -> List[Dict[
 
 
 
+# @router.post("/{project_id}/chats/{chat_id}/messages")
+# async def send_message(
+#     project_id: str,
+#     chat_id: str,
+#     message: MessageCreate,
+#     current_user_clerk_id: str = Depends(get_current_user_clerk_id),
+# ):
+#     """
+#     Step 1 : Insert the message into the database.
+#     Step 2 : Check for structured vs unstructured files.
+#     Step 3 : Pipeline A (Structured) - Invoke CSV Agent if CSV/Excel files exist.
+#     Step 4 : Pipeline B (Unstructured) - Invoke RAG Agent if other files exist or fallback.
+#     Step 5 : Combine responses and insert into database.
+#     """
+#     try:
+#         # Step 1 : Insert the message into the database.
+#         message_content = message.content
+#         message_insert_data = {
+#             "content": message_content,
+#             "chat_id": chat_id,
+#             "clerk_id": current_user_clerk_id,
+#             "role": MessageRole.USER.value,
+#         }
+#         message_creation_result = (
+#             supabase.table("messages").insert(message_insert_data).execute()
+#         )
+#         if not message_creation_result.data:
+#             raise HTTPException(status_code=422, detail="Failed to create message")
+        
+#         current_message_id = message_creation_result.data[0]["id"]
+        
+#         # Step 2 : Analyze available files to determine pipelines
+#         project_docs_result = supabase.table("project_documents").select("*").eq("project_id", project_id).eq("processing_status", "completed").execute()
+#         project_docs = project_docs_result.data or []
+        
+#         structured_files = []
+#         unstructured_files = []
+#         print("=== PIPELINE DEBUG START ===")
+
+#         print(f"Structured files count: {len(structured_files)}")
+#         print(f"Unstructured files count: {len(unstructured_files)}")
+        
+#         for doc in project_docs:
+#             fname = doc.get("filename", "").lower()
+#             if fname.endswith(('.csv', '.xlsx', '.xls')):
+#                 structured_files.append(doc)
+#             else:
+#                 unstructured_files.append(doc)
+        
+#         csv_response_text = ""
+#         rag_response_text = ""
+#         citations = [] # RAG only mostly
+
+#         # Step 3 : Structured Pipeline (CSV Agent)
+#         if structured_files:
+#             print(">>> SQL PIPELINE TRIGGERED")
+
+#             # We need both structured files AND a schema definition to run the smart agent
+#             schema_path = None
+            
+#             # Check for schema file (any .json file) in project documents
+#             for doc in project_docs:
+#                 if doc.get("filename", "").lower().endswith(".json"):
+#                     s3_key = doc["s3_key"]
+#                     fname = doc["filename"]
+#                     temp_dir = f"/tmp/schema_agent/{project_id}"
+#                     os.makedirs(temp_dir, exist_ok=True)
+#                     local_path = os.path.join(temp_dir, fname)
+                    
+#                     # Download schema
+#                     try:
+#                         s3_client.download_file(appConfig["s3_bucket_name"], s3_key, local_path)
+#                         schema_path = local_path
+#                     except Exception as e:
+#                         print(f"Failed to download schema: {e}")
+#                     break
+
+#             if schema_path:
+#                 try:
+#                     # Create temp dir for this project's CSVs
+#                     temp_dir = f"/tmp/csv_agent/{project_id}"
+#                     os.makedirs(temp_dir, exist_ok=True)
+                    
+#                     local_csv_paths = []
+#                     for doc in structured_files:
+#                         s3_key = doc["s3_key"]
+#                         fname = doc["filename"]
+#                         local_path = os.path.join(temp_dir, fname)
+                        
+#                         # Download file (overwrite or check existence - downloading ensures freshness)
+#                         s3_client.download_file(appConfig["s3_bucket_name"], s3_key, local_path)
+#                         local_csv_paths.append(local_path)
+                    
+#                     # Invoke NEW Smart Agent
+#                     from src.agents.smart_sql_agent import create_smart_agent
+                    
+#                     agent = create_smart_agent(local_csv_paths, schema_path)
+#                     result = agent.execute_and_answer(message_content)
+                    
+#                     if isinstance(result, dict):
+#                          csv_response_text = result.get("answer", "No answer generated.")
+#                     else:
+#                          csv_response_text = str(result)
+                    
+#                 except Exception as e:
+#                     print(f"Smart SQL Agent failed: {e}")
+#                     csv_response_text = f"[Error analyzing structured data: {str(e)}]"
+#             else:
+#                  csv_response_text = "[Notice: Structured files found but no JSON schema file was detected. Please upload a .json schema file to process the data.]"
+
+#         # Step 4 : Unstructured Pipeline (RAG Agent / Web Search)
+#         # We run this pipeline to handle:
+#         # 1. Unstructured documents (PDFs, etc.)
+#         # 2. Web Search (if Agentic mode)
+#         # 3. General conversation
+#         should_run_rag = True
+        
+#         if should_run_rag:
+#             print(">>> RAG PIPELINE TRIGGERED")
+
+#             # Step 2 (orig) : Get project settings
+#             try:
+#                 project_settings = await get_project_settings(project_id)
+#                 agent_type = project_settings["data"].get("agent_type", "simple")
+#             except Exception:
+#                 agent_type = "simple"
+                
+#             # Step 3 (orig) : Get chat history
+#             chat_history = get_chat_history(chat_id, exclude_message_id=current_message_id)
+            
+#             agent = None
+#             if agent_type == "simple":
+#                 agent = create_simple_rag_agent(
+#                     project_id=project_id,
+#                     chat_history=chat_history
+#                 )
+#             elif agent_type == "agentic":
+#                 agent = create_supervisor_agent(
+#                     project_id=project_id,
+#                     chat_history=chat_history
+#                 )
+
+#             if agent:
+#                 result = agent.invoke({
+#                     "messages": [{"role": "user", "content": message_content}]
+#                 })
+#                 rag_response_text = result["messages"][-1].content
+#                 citations = result.get("citations", [])
+
+#         # Step 5 : Combine Responses
+#         final_response = ""
+        
+#         # Check if RAG response is just a generic "I don't know" or similar, and if we have a valid CSV response
+#         # Check if RAG response is just a generic "I don't know" or similar, and if we have a valid CSV response
+#         rag_is_generic = False
+#         if rag_response_text:
+#              lower_rag = rag_response_text.lower()
+#              generic_phrases = [
+#                  "project documents do not contain",
+#                  "i searched available resources but found no",
+#                  "information not present",
+#                  "to find this information, you would typically",
+#                  "you would typically need to query",
+#                  "no relevant chunks found",
+#                  "analysis from structured data",
+#                  "executed sql"
+#              ]
+#              if any(phrase in lower_rag for phrase in generic_phrases):
+#                  rag_is_generic = True
+#                  rag_response_text = "No relevant chunks found"
+
+#         if csv_response_text and rag_response_text:
+#             final_response = f"**Analysis from Structured Data:**\n{csv_response_text}\n\n**Analysis from Documents:**\n{rag_response_text}"
+#         elif csv_response_text:
+#             final_response = csv_response_text
+#         elif rag_response_text:
+#             final_response = rag_response_text
+#         else:
+#             final_response = "I searched available resources but found no relevant information or experienced an error."
+
+#         # Insert AI Response
+#         ai_response_insert_data = {
+#             "content": final_response,
+#             "chat_id": chat_id,
+#             "clerk_id": current_user_clerk_id,
+#             "role": MessageRole.ASSISTANT.value,
+#             "citations": citations,
+#         }
+
+#         ai_response_creation_result = (
+#             supabase.table("messages").insert(ai_response_insert_data).execute()
+#         )
+#         if not ai_response_creation_result.data:
+#             raise HTTPException(status_code=422, detail="Failed to create AI response")
+
+#         return {
+#             "message": "Message created successfully",
+#             "data": {
+#                 "userMessage": message_creation_result.data[0],
+#                 "aiMessage": ai_response_creation_result.data[0],
+#             },
+#         }
+
+#     except HTTPException as e:
+#         raise e
+
+#     except Exception as e:
+#         import traceback
+#         traceback.print_exc()  # prints full stack trace to terminal
+#         raise HTTPException(
+#             status_code=500,
+#             detail=f"An internal server error occurred while creating message: {str(e)}",
+#         )
+
+def classify_query_intent_llm(query: str) -> str:
+    prompt = f"""
+Classify the user query into one of:
+- structured → SQL/data analysis
+- unstructured → document understanding
+- both → requires both
+
+Return ONLY JSON:
+{{"intent": "structured" | "unstructured" | "both"}}
+
+Query: {query}
+"""
+
+    try:
+        res = openAI["mini_llm"].invoke(prompt)
+        parsed = json.loads(res.content)
+        intent = parsed.get("intent", "both")
+
+        if intent not in ["structured", "unstructured", "both"]:
+            return "both"
+
+        return intent
+
+    except Exception as e:
+        print(f"Intent classification failed: {e}")
+        return "both"
+
 @router.post("/{project_id}/chats/{chat_id}/messages")
 async def send_message(
     project_id: str,
@@ -460,181 +705,184 @@ async def send_message(
     message: MessageCreate,
     current_user_clerk_id: str = Depends(get_current_user_clerk_id),
 ):
-    """
-    Step 1 : Insert the message into the database.
-    Step 2 : Check for structured vs unstructured files.
-    Step 3 : Pipeline A (Structured) - Invoke CSV Agent if CSV/Excel files exist.
-    Step 4 : Pipeline B (Unstructured) - Invoke RAG Agent if other files exist or fallback.
-    Step 5 : Combine responses and insert into database.
-    """
     try:
-        # Step 1 : Insert the message into the database.
+        # Step 1 : Insert user message
         message_content = message.content
+
         message_insert_data = {
             "content": message_content,
             "chat_id": chat_id,
             "clerk_id": current_user_clerk_id,
             "role": MessageRole.USER.value,
         }
+
         message_creation_result = (
             supabase.table("messages").insert(message_insert_data).execute()
         )
+
         if not message_creation_result.data:
             raise HTTPException(status_code=422, detail="Failed to create message")
-        
+
         current_message_id = message_creation_result.data[0]["id"]
-        
-        # Step 2 : Analyze available files to determine pipelines
-        project_docs_result = supabase.table("project_documents").select("*").eq("project_id", project_id).eq("processing_status", "completed").execute()
+
+        # Step 2 : Fetch project documents
+        project_docs_result = (
+            supabase.table("project_documents")
+            .select("*")
+            .eq("project_id", project_id)
+            .eq("processing_status", "completed")
+            .execute()
+        )
+
         project_docs = project_docs_result.data or []
-        
+
         structured_files = []
         unstructured_files = []
-        
+
         for doc in project_docs:
             fname = doc.get("filename", "").lower()
-            if fname.endswith(('.csv', '.xlsx', '.xls')):
+
+            if fname.endswith((".csv", ".xlsx", ".xls")):
                 structured_files.append(doc)
             else:
                 unstructured_files.append(doc)
-        
-        csv_response_text = ""
-        rag_response_text = ""
-        citations = [] # RAG only mostly
 
-        # Step 3 : Structured Pipeline (CSV Agent)
-        if structured_files:
-            # We need both structured files AND a schema definition to run the smart agent
+        print("=== PIPELINE DEBUG START ===")
+        print(f"Structured files: {[d.get('filename') for d in structured_files]}")
+        print(f"Unstructured files: {[d.get('filename') for d in unstructured_files]}")
+        print(f"Structured count: {len(structured_files)}")
+        print(f"Unstructured count: {len(unstructured_files)}")
+
+
+
+        intent = classify_query_intent_llm(message_content)
+        print(f"Query intent (LLM): {intent}")
+
+        run_sql = len(structured_files) > 0 and intent in ["structured", "both"]
+        run_rag = len(unstructured_files) > 0 and intent in ["unstructured", "both"]
+        structured_response_text = ""
+        rag_response_text = ""
+        citations = []
+
+        # Step 3 : Structured Pipeline (SQL Agent)
+        if run_sql:
+            print(">>> SQL PIPELINE TRIGGERED")
+
             schema_path = None
-            
-            # Check for schema file (any .json file) in project documents
+
+            # Find schema file
             for doc in project_docs:
-                if doc.get("filename", "").lower().endswith(".json"):
+                fname = doc.get("filename", "").lower()
+
+                if fname.endswith(".json"):
                     s3_key = doc["s3_key"]
-                    fname = doc["filename"]
                     temp_dir = f"/tmp/schema_agent/{project_id}"
                     os.makedirs(temp_dir, exist_ok=True)
-                    local_path = os.path.join(temp_dir, fname)
-                    
-                    # Download schema
+
+                    local_path = os.path.join(temp_dir, doc["filename"])
+
                     try:
-                        s3_client.download_file(appConfig["s3_bucket_name"], s3_key, local_path)
+                        s3_client.download_file(
+                            appConfig["s3_bucket_name"],
+                            s3_key,
+                            local_path,
+                        )
                         schema_path = local_path
                     except Exception as e:
-                        print(f"Failed to download schema: {e}")
+                        print(f"Schema download failed: {e}")
                     break
 
             if schema_path:
                 try:
-                    # Create temp dir for this project's CSVs
                     temp_dir = f"/tmp/csv_agent/{project_id}"
                     os.makedirs(temp_dir, exist_ok=True)
-                    
+
                     local_csv_paths = []
+
                     for doc in structured_files:
                         s3_key = doc["s3_key"]
-                        fname = doc["filename"]
-                        local_path = os.path.join(temp_dir, fname)
-                        
-                        # Download file (overwrite or check existence - downloading ensures freshness)
-                        s3_client.download_file(appConfig["s3_bucket_name"], s3_key, local_path)
+                        local_path = os.path.join(temp_dir, doc["filename"])
+
+                        s3_client.download_file(
+                            appConfig["s3_bucket_name"],
+                            s3_key,
+                            local_path,
+                        )
+
                         local_csv_paths.append(local_path)
-                    
-                    # Invoke NEW Smart Agent
+
                     from src.agents.smart_sql_agent import create_smart_agent
-                    
+
                     agent = create_smart_agent(local_csv_paths, schema_path)
+
                     result = agent.execute_and_answer(message_content)
-                    
+
                     if isinstance(result, dict):
-                         csv_response_text = result.get("answer", "No answer generated.")
+                        structured_response_text = result.get("answer", "")
                     else:
-                         csv_response_text = str(result)
-                    
+                        structured_response_text = str(result)
+
                 except Exception as e:
                     print(f"Smart SQL Agent failed: {e}")
-                    csv_response_text = f"[Error analyzing structured data: {str(e)}]"
-            else:
-                 csv_response_text = "[Notice: Structured files found but no JSON schema file was detected. Please upload a .json schema file to process the data.]"
+                    structured_response_text = f"[SQL Error: {str(e)}]"
 
-        # Step 4 : Unstructured Pipeline (RAG Agent / Web Search)
-        # We run this pipeline to handle:
-        # 1. Unstructured documents (PDFs, etc.)
-        # 2. Web Search (if Agentic mode)
-        # 3. General conversation
-        should_run_rag = True
-        
-        if should_run_rag:
-            # Step 2 (orig) : Get project settings
+            else:
+                structured_response_text = (
+                    "[Schema missing: upload .json schema to analyze structured data]"
+                )
+
+        # Step 4 : RAG Pipeline
+
+        if run_rag:
+            print(">>> RAG PIPELINE TRIGGERED")
+
             try:
                 project_settings = await get_project_settings(project_id)
                 agent_type = project_settings["data"].get("agent_type", "simple")
             except Exception:
                 agent_type = "simple"
-                
-            # Step 3 (orig) : Get chat history
-            chat_history = get_chat_history(chat_id, exclude_message_id=current_message_id)
-            
-            agent = None
+
+            chat_history = get_chat_history(
+                chat_id,
+                exclude_message_id=current_message_id,
+            )
+
             if agent_type == "simple":
                 agent = create_simple_rag_agent(
                     project_id=project_id,
-                    model="gpt-4o",
-                    chat_history=chat_history
+                    chat_history=chat_history,
                 )
-            elif agent_type == "agentic":
+            else:
                 agent = create_supervisor_agent(
                     project_id=project_id,
-                    model="gpt-4o",
-                    chat_history=chat_history
+                    chat_history=chat_history,
                 )
 
             if agent:
+                result = agent.invoke({
+                    "messages": [{"role": "user", "content": message_content}]
+                })
 
-                try:
-                    result = agent.invoke({
-                        "messages": [{"role": "user", "content": message_content}]
-                    })
-                    rag_response_text = result["messages"][-1].content
-                    citations = result.get("citations", [])
-                except Exception as llm_error:
-                    print("LLM ERROR:", str(llm_error))
-                    rag_response_text = "⚠️ AI service is temporarily unavailable. Please try again later."
-                    citations = []
+                rag_response_text = result["messages"][-1].content
+                citations = result.get("citations", [])
 
-        # Step 5 : Combine Responses
-        final_response = ""
-        
-        # Check if RAG response is just a generic "I don't know" or similar, and if we have a valid CSV response
-        # Check if RAG response is just a generic "I don't know" or similar, and if we have a valid CSV response
-        rag_is_generic = False
-        if rag_response_text:
-             lower_rag = rag_response_text.lower()
-             generic_phrases = [
-                 "project documents do not contain",
-                 "i searched available resources but found no",
-                 "information not present",
-                 "to find this information, you would typically",
-                 "you would typically need to query",
-                 "no relevant chunks found",
-                 "analysis from structured data",
-                 "executed sql"
-             ]
-             if any(phrase in lower_rag for phrase in generic_phrases):
-                 rag_is_generic = True
-                 rag_response_text = "No relevant chunks found"
+        print("=== PIPELINE DEBUG END ===")
 
-        if csv_response_text and rag_response_text:
-            final_response = f"**Analysis from Structured Data:**\n{csv_response_text}\n\n**Analysis from Documents:**\n{rag_response_text}"
-        elif csv_response_text:
-            final_response = csv_response_text
+        # Step 5 : Merge response
+        if structured_response_text and rag_response_text:
+            final_response = (
+                f"**Structured Data:**\n{structured_response_text}\n\n"
+                f"**Documents:**\n{rag_response_text}"
+            )
+        elif structured_response_text:
+            final_response = structured_response_text
         elif rag_response_text:
             final_response = rag_response_text
         else:
-            final_response = "I searched available resources but found no relevant information or experienced an error."
+            final_response = "No relevant information found."
 
-        # Insert AI Response
-        ai_response_insert_data = {
+        # Step 6 : Save AI response
+        ai_response = {
             "content": final_response,
             "chat_id": chat_id,
             "clerk_id": current_user_clerk_id,
@@ -642,33 +890,26 @@ async def send_message(
             "citations": citations,
         }
 
-        ai_response_creation_result = (
-            supabase.table("messages").insert(ai_response_insert_data).execute()
-        )
-        if not ai_response_creation_result.data:
+        ai_result = supabase.table("messages").insert(ai_response).execute()
+
+        if not ai_result.data:
             raise HTTPException(status_code=422, detail="Failed to create AI response")
 
         return {
             "message": "Message created successfully",
             "data": {
                 "userMessage": message_creation_result.data[0],
-                "aiMessage": ai_response_creation_result.data[0],
+                "aiMessage": ai_result.data[0],
             },
         }
 
     except HTTPException as e:
         raise e
-    
-
-
-    # except Exception as e:
-    #     print("MESSAGE PIPELINE ERROR:", str(e))
-    #     import traceback
-    #     traceback.print_exc()
-    #     raise HTTPException(status_code=500, detail=str(e))
 
     except Exception as e:
+        import traceback
+        traceback.print_exc()
         raise HTTPException(
             status_code=500,
-            detail=f"An internal server error occurred while creating message: {str(e)}",
+            detail=f"Internal error: {str(e)}",
         )
